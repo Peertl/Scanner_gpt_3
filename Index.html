@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<title>Parcel 3D Precision (Half Auto)</title>
+<script async src="https://docs.opencv.org/4.8.0/opencv.js"></script>
+<style>
+body{margin:0;background:#000;color:#fff;font-family:sans-serif}
+video,canvas{position:absolute;top:0;left:0;width:100vw;height:100vh;object-fit:cover}
+#ui{
+position:absolute;
+top:10px;
+left:10px;
+background:rgba(0,0,0,.75);
+padding:12px;
+border-radius:10px;
+white-space:pre;
+}
+button{margin-top:6px;padding:6px}
+</style>
+</head>
+<body>
+
+<video id="video" playsinline muted></video>
+<canvas id="canvas"></canvas>
+
+<div id="ui">
+Lade OpenCV...
+<button onclick="resetAll()">Reset</button>
+</div>
+
+<script>
+
+let video = document.getElementById("video");
+let canvas = document.getElementById("canvas");
+let ctx = canvas.getContext("2d");
+
+const A4_W = 21.0;
+const A4_H = 29.7;
+
+let objectPoints = new cv.MatVector();
+let imagePoints = new cv.MatVector();
+
+let cameraMatrix, distCoeffs;
+let calibrated = false;
+let calibrationFrames = 0;
+
+let currentRvec, currentTvec;
+let parcelBasePoints = [];
+let heightPoint = null;
+
+function resetAll(){
+location.reload();
+}
+
+function initCamera(){
+navigator.mediaDevices.getUserMedia({
+video:{facingMode:"environment",width:{ideal:1280}}
+}).then(stream=>{
+video.srcObject=stream;
+video.play();
+video.onloadedmetadata=()=>{
+canvas.width=video.videoWidth;
+canvas.height=video.videoHeight;
+requestAnimationFrame(loop);
+};
+});
+}
+
+function loop(){
+ctx.drawImage(video,0,0,canvas.width,canvas.height);
+let src = cv.imread(canvas);
+
+if(!calibrated){
+detectCalibration(src);
+}else{
+let undist = new cv.Mat();
+cv.undistort(src,undist,cameraMatrix,distCoeffs);
+processFrame(undist);
+undist.delete();
+}
+
+src.delete();
+requestAnimationFrame(loop);
+}
+
+function detectCalibration(src){
+
+let gray=new cv.Mat();
+let edges=new cv.Mat();
+let contours=new cv.MatVector();
+let hierarchy=new cv.Mat();
+
+cv.cvtColor(src,gray,cv.COLOR_RGBA2GRAY);
+cv.GaussianBlur(gray,gray,new cv.Size(5,5),0);
+cv.Canny(gray,edges,50,150);
+cv.findContours(edges,contours,hierarchy,cv.RETR_EXTERNAL,cv.CHAIN_APPROX_SIMPLE);
+
+for(let i=0;i<contours.size();i++){
+let cnt=contours.get(i);
+let approx=new cv.Mat();
+cv.approxPolyDP(cnt,approx,0.02*cv.arcLength(cnt,true),true);
+
+if(approx.rows===4 && cv.contourArea(cnt)>40000){
+
+let imgPts=cv.matFromArray(4,1,cv.CV_32FC2,approx.data32S);
+
+let objPts=cv.matFromArray(4,1,cv.CV_32FC3,[
+0,0,0,
+A4_W,0,0,
+A4_W,A4_H,0,
+0,A4_H,0
+]);
+
+imagePoints.push_back(imgPts);
+objectPoints.push_back(objPts);
+
+calibrationFrames++;
+
+document.getElementById("ui").innerText=
+"Kalibrierung: "+calibrationFrames+"/20\nBewege das A4 Blatt.";
+
+if(calibrationFrames>=20){
+calibrateCamera();
+}
+
+approx.delete();
+break;
+}
+approx.delete();
+}
+
+gray.delete();edges.delete();contours.delete();hierarchy.delete();
+}
+
+function calibrateCamera(){
+
+cameraMatrix=new cv.Mat();
+distCoeffs=new cv.Mat();
+let rvecs=new cv.MatVector();
+let tvecs=new cv.MatVector();
+
+cv.calibrateCamera(
+objectPoints,
+imagePoints,
+new cv.Size(canvas.width,canvas.height),
+cameraMatrix,
+distCoeffs,
+rvecs,
+tvecs
+);
+
+calibrated=true;
+
+document.getElementById("ui").innerText=
+"Kalibrierung abgeschlossen.\nPaket neben A4 platzieren.\nObere Vorderkante antippen.";
+
+}
+
+function processFrame(src){
+
+detectA4Pose(src);
+detectParcelBase(src);
+
+if(parcelBasePoints.length===2 && heightPoint){
+
+let pBottom = imageToWorld(parcelBasePoints[0]);
+let pHeight = imageToWorld(heightPoint);
+
+let height = Math.abs(pHeight.z - pBottom.z);
+
+let length = distance3D(
+imageToWorld(parcelBasePoints[0]),
+imageToWorld(parcelBasePoints[1])
+);
+
+document.getElementById("ui").innerText=
+"Länge: "+length.toFixed(2)+" cm\n"+
+"Höhe: "+height.toFixed(2)+" cm\nTippe erneut für neue Höhe.";
+}
+}
+
+function detectA4Pose(src){
+
+let gray=new cv.Mat();
+let edges=new cv.Mat();
+let contours=new cv.MatVector();
+let hierarchy=new cv.Mat();
+
+cv.cvtColor(src,gray,cv.COLOR_RGBA2GRAY);
+cv.Canny(gray,edges,50,150);
+cv.findContours(edges,contours,hierarchy,cv.RETR_EXTERNAL,cv.CHAIN_APPROX_SIMPLE);
+
+for(let i=0;i<contours.size();i++){
+let cnt=contours.get(i);
+let approx=new cv.Mat();
+cv.approxPolyDP(cnt,approx,0.02*cv.arcLength(cnt,true),true);
+
+if(approx.rows===4 && cv.contourArea(cnt)>40000){
+
+let imgPts=cv.matFromArray(4,1,cv.CV_32FC2,approx.data32S);
+let objPts=cv.matFromArray(4,1,cv.CV_32FC3,[
+0,0,0,
+A4_W,0,0,
+A4_W,A4_H,0,
+0,A4_H,0
+]);
+
+currentRvec=new cv.Mat();
+currentTvec=new cv.Mat();
+
+cv.solvePnP(objPts,imgPts,cameraMatrix,distCoeffs,currentRvec,currentTvec);
+
+approx.delete();
+break;
+}
+approx.delete();
+}
+
+gray.delete();edges.delete();contours.delete();hierarchy.delete();
+}
+
+function detectParcelBase(src){
+
+let gray=new cv.Mat();
+let edges=new cv.Mat();
+let contours=new cv.MatVector();
+let hierarchy=new cv.Mat();
+
+cv.cvtColor(src,gray,cv.COLOR_RGBA2GRAY);
+cv.Canny(gray,edges,60,180);
+cv.findContours(edges,contours,hierarchy,cv.RETR_EXTERNAL,cv.CHAIN_APPROX_SIMPLE);
+
+let best=null;
+let bestArea=0;
+
+for(let i=0;i<contours.size();i++){
+let cnt=contours.get(i);
+let area=cv.contourArea(cnt);
+if(area>bestArea && area>60000){
+best=cv.minAreaRect(cnt);
+bestArea=area;
+}
+}
+
+if(best){
+let pts=cv.RotatedRect.points(best);
+parcelBasePoints=[pts[0],pts[1]];
+}
+
+gray.delete();edges.delete();contours.delete();hierarchy.delete();
+}
+
+function imageToWorld(pt){
+
+let invCam=cameraMatrix.inv();
+let uv1=cv.matFromArray(3,1,cv.CV_64F,[pt.x,pt.y,1.0]);
+
+let temp=new cv.Mat();
+cv.gemm(invCam,uv1,1,new cv.Mat(),0,temp);
+
+let rotMat=new cv.Mat();
+cv.Rodrigues(currentRvec,rotMat);
+
+let rotInv=rotMat.inv();
+let world=new cv.Mat();
+
+cv.gemm(rotInv,temp,1,currentTvec,-1,world);
+
+return {
+x:world.doubleAt(0,0),
+y:world.doubleAt(1,0),
+z:world.doubleAt(2,0)
+};
+}
+
+function distance3D(a,b){
+return Math.sqrt(
+(a.x-b.x)*(a.x-b.x)+
+(a.y-b.y)*(a.y-b.y)+
+(a.z-b.z)*(a.z-b.z)
+);
+}
+
+canvas.addEventListener("click",(e)=>{
+let rect=canvas.getBoundingClientRect();
+heightPoint={
+x:(e.clientX-rect.left)*(canvas.width/rect.width),
+y:(e.clientY-rect.top)*(canvas.height/rect.height)
+};
+});
+
+cv.onRuntimeInitialized=()=>{
+document.getElementById("ui").innerText="OpenCV geladen\nStarte Kamera...";
+initCamera();
+};
+
+</script>
+</body>
+</html>
